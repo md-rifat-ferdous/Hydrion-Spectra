@@ -111,12 +111,19 @@ def build_ack(acked_seq, status=0x00):
     return build_frame(acked_seq, MSG_ACK, bytes([status]) + echo)
 
 
-def build_status(esp_seq, failsafe=0, estop=0, motors=(0, 0, 0, 0, 0), pad=True):
-    """Build a firmware-style STATUS (LENGTH=14; 12 meaningful payload bytes)."""
-    payload = bytes([failsafe, estop]) + motor_values_to_int16(motors)
-    if pad:
-        payload += bytes(2)  # firmware reserves a 14-byte payload region
-    return build_frame(esp_seq, MSG_STATUS, payload)
+def build_status(esp_seq, failsafe=0, estop=0, motors=(0, 0, 0, 0, 0)):
+    """Build the exact frame the ESP32 firmware sendStatus() emits.
+
+    AA55 | VERSION | TYPE=0x82 | LENGTH=14 | SEQ(2) FAILSAFE(1) ESTOP(1)
+    M1..M5 int16(10) | CRC16 -> 21 bytes on the wire (LENGTH counts the
+    2-byte sequence as part of the payload).
+    """
+    payload = struct.pack("<H", esp_seq & 0xFFFF)
+    payload += bytes([failsafe, estop])
+    payload += motor_values_to_int16(motors)
+    head = struct.pack("<BBB", PROTOCOL_VERSION, MSG_STATUS, len(payload))
+    frame = HEADER + head + payload
+    return frame + struct.pack("<H", crc16_ccitt(frame))
 
 
 class FakeSerial:
@@ -269,14 +276,20 @@ class AckStatusParsingTest(unittest.TestCase):
         st = build_status(
             9, failsafe=1, estop=0, motors=(0.1, -0.1, 0.05, 0.0, -0.05)
         )
+        self.assertEqual(len(st), 21)  # 5 + LENGTH(14) + CRC(2), no extra seq slot
         packet, consumed = parse_frame(st)
-        self.assertEqual(consumed, 23)  # total = 7 + LENGTH(14) + 2
+        self.assertEqual(consumed, 21)
         self.assertEqual(packet.mtype, MSG_STATUS)
         self.assertEqual(packet.sequence, 9)
         info = decode_status(packet.payload)
         self.assertEqual(
             info,
-            {"failsafe": True, "estop": False, "motors": (100, -100, 50, 0, -50)},
+            {
+                "sequence": 9,
+                "failsafe": True,
+                "estop": False,
+                "motors": (100, -100, 50, 0, -50),
+            },
         )
 
 
@@ -626,13 +639,30 @@ class Esp32ProviderTest(unittest.TestCase):
         self.assertFalse(mgr.provider._estop)
         mgr.stop()
 
-    def test_manager_failsafe_zeroes_outputs_with_no_link(self):
+    def test_manager_failsafe_keeps_setpoints_but_applies_zeros(self):
+        """Failsafe must NOT flatten the internal ramped setpoints.
+
+        ''last_setpoints'' is the truth the GUI and power readout report: with
+        W held the ramp still climbs M2/M3 (0 -> 0.1 -> ... -> soft ceiling)
+        even while the ESP32 link is down. Safety is preserved because the
+        provider is handed ZEROS to apply, and the ESP32 provider additionally
+        keeps its wire-level gate closed while not ACKed.
+        """
         mgr = ThrusterManager(PROVIDER_CONFIG, sensors=None)
         mgr.initialize()
         mgr.start()
-        mgr.set_motion(MotionState(surge=1.0, heave=1.0))
-        mgr.update()  # not connected -> esp32 failsafe -> zero setpoints
-        self.assertEqual(mgr.last_setpoints, {t: 0.0 for t in ALL})
+        mgr.set_throttle_mode("soft")
+        mgr.set_motion(MotionState(surge=1.0))
+        mgr.update()  # not connected -> esp32 failsafe active
+        for _ in range(5):  # 0 -> .1 -> .2 -> .3 -> .4 -> .4 (soft ceiling)
+            mgr.update()
+        # Internal setpoints are the real, correct ramped values ...
+        self.assertAlmostEqual(mgr.last_setpoints[M2], 0.40, places=6)
+        self.assertAlmostEqual(mgr.last_setpoints[M3], 0.40, places=6)
+        self.assertEqual(mgr.last_setpoints[M1], 0.0)  # surge-only: no heave
+        # ... but what the provider applies/transmits stays zero (failsafe).
+        self.assertTrue(mgr.provider.status()["failsafe"])
+        self.assertEqual(mgr.provider._pending, [0.0] * 5)
         mgr.stop()
 
     def test_initialize_starts_thread_once(self):
@@ -641,6 +671,60 @@ class Esp32ProviderTest(unittest.TestCase):
         self.assertIsNotNone(provider._thread)
         provider.stop()
         self.assertIsNone(provider._thread)
+
+
+class UartConfigTest(unittest.TestCase):
+    """Lock the real Pi<->ESP32 wiring + baud in configs/thrusters.yaml.
+
+    The ESP32 uses its UART0 pins (RX0 = GPIO3, TX0 = GPIO1); the Pi uses the
+    on-board /dev/ttyAMA0 (UART0, GPIO14 TXD0 / GPIO15 RXD0) at 460800 baud.
+    These values must not silently regress.
+    """
+
+    def _esp32_cfg(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "configs", "thrusters.yaml")
+        with open(path) as f:
+            import yaml
+
+            data = yaml.safe_load(f)
+        return data["thrusters"]["esp32"]
+
+    def test_pi_device_and_baud(self):
+        cfg = self._esp32_cfg()
+        self.assertEqual(cfg["serial_port"], "/dev/ttyAMA0")
+        self.assertEqual(cfg["baudrate"], 460800)
+
+    def test_esp32_uart0_pins(self):
+        cfg = self._esp32_cfg()
+        self.assertEqual(cfg["rx_pin"], 3)  # ESP32 GPIO3 (RX0)
+        self.assertEqual(cfg["tx_pin"], 1)  # ESP32 GPIO1 (TX0)
+
+    def test_motor_gpio_mapping_unchanged(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "configs", "thrusters.yaml")
+        import yaml
+
+        with open(path) as f:
+            motors = yaml.safe_load(f)["thrusters"]["motors"]
+        expected = {
+            "M1_FRONT_VERTICAL": 25,
+            "M2_MIDDLE_RIGHT_HORIZONTAL": 33,
+            "M3_MIDDLE_LEFT_HORIZONTAL": 32,
+            "M4_BACK_RIGHT_VERTICAL": 27,
+            "M5_BACK_LEFT_VERTICAL": 26,
+        }
+        for name, pin in expected.items():
+            self.assertEqual(motors[name]["gpio"], pin)
+
+    def test_transport_uses_config_baud(self):
+        cfg = dict(self._esp32_cfg())
+        cfg.update({"serial_port": "/dev/ttyAMA0", "baudrate": 460800})
+        transport = UartTransport(cfg, serial_factory=FakeSerial)
+        self.assertEqual(transport.port, "/dev/ttyAMA0")
+        self.assertEqual(transport.baudrate, 460800)
+        transport.open()
+        self.assertEqual(transport._ser.baudrate, 460800)
 
 
 if __name__ == "__main__":

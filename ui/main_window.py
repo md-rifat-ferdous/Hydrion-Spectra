@@ -46,6 +46,12 @@ NAV_ITEMS = [
 
 _TYPING_WIDGETS = (QLineEdit, QTextEdit, QSpinBox, QComboBox)
 
+# Dashboard sidebar sizing/shaping. Sidebars keep a controlled width so the
+# central camera viewport always keeps the largest share of the window.
+_SIDEBAR_W = 262
+_DASH_MARGIN = 10
+_DASH_SPACING = 10
+
 
 class MainWindow(QMainWindow):
     def __init__(self, camera_manager, overlay=None, hud_provider=None,
@@ -76,6 +82,7 @@ class MainWindow(QMainWindow):
         self._cam_size = (0, 0)
 
         self.setWindowTitle("DUBO - ROV Controller")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.resize(1440, 820)
 
         self._ctx = {
@@ -168,7 +175,7 @@ class MainWindow(QMainWindow):
         )
         lay.addSpacing(28)
         lay.addWidget(workspace)
-        lay.addStretch(1)
+        lay.addSpacing(28)
 
         self.rov_pill = StatusPill("ROV --", "info")
         self.esp32_pill = StatusPill("ESP32 --", "info")
@@ -181,9 +188,7 @@ class MainWindow(QMainWindow):
         for pill in (self.rov_pill, self.esp32_pill, self.mode_pill,
                      self.depth_pill, self.batt_pill, self.estop_pill,
                      self.link_pill, self.uptime_pill):
-            lay.addWidget(pill)
-            lay.addSpacing(6)
-        lay.addSpacing(10)
+            lay.addWidget(pill, 1, Qt.AlignCenter)
         avatar = QLabel("P")
         avatar.setFixedSize(30, 30)
         avatar.setAlignment(Qt.AlignCenter)
@@ -191,7 +196,7 @@ class MainWindow(QMainWindow):
             f"background: {C['surface_high']}; color: {C['primary']}; "
             f"border: 1px solid rgba(100, 255, 218, 0.3); border-radius: 15px;"
         )
-        lay.addWidget(avatar)
+        lay.addWidget(avatar, 1, Qt.AlignCenter)
         return bar
 
     def _build_rail(self):
@@ -284,36 +289,47 @@ class MainWindow(QMainWindow):
     def _build_dashboard(self):
         container = QWidget()
         container.setStyleSheet("background: #000000;")
-        lay = QVBoxLayout(container)
-        lay.setContentsMargins(0, 0, 0, 0)
+        self.camera_container = container
 
+        # Full-bleed live-feed backdrop, exactly like the original DUBO HUD.
+        # The translucent glass deck floats over it, so the camera stays
+        # visible through the panels. (Plain QWidget hosts underneath are the
+        # only thing that can hide it: the global `QWidget { background: }`
+        # rule paints them opaque navy, so every host gets an explicit
+        # transparent background below.)
+        cam_lay = QVBoxLayout(container)
+        cam_lay.setContentsMargins(0, 0, 0, 0)
         self.camera_view = QLabel("LIVE CAMERA FEED")
         self.camera_view.setAlignment(Qt.AlignCenter)
         self.camera_view.setMinimumSize(1, 1)
         self.camera_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.camera_view.setStyleSheet("background: #000; color: #556; font-weight: bold;")
-        lay.addWidget(self.camera_view)
-        self.camera_container = container
+        cam_lay.addWidget(self.camera_view)
 
-        self.live = QLabel()
-        self.live.setText(" \u25cf LIVE: CH-1 MAIN CAM")
-        self.live.setStyleSheet(
-            f"background: rgba(17, 32, 54, 0.55); color: {C['on_surface']}; "
-            f"border: 1px solid {C['outline_variant']}; border-radius: 8px; "
-            f"padding: 3px 10px; font-family: {FONT_DATA}; font-size: 12px;"
-        )
-        self.live.setParent(container)
-        self.live.adjustSize()
-        self.live.show()
+        # Transparent glass deck: holds the layout, paints nothing itself.
+        deck = QWidget(container)
+        deck.setStyleSheet("background: transparent;")
+        self._deck = deck
+        root = QVBoxLayout(deck)
+        root.setContentsMargins(_DASH_MARGIN, _DASH_MARGIN, _DASH_MARGIN, _DASH_MARGIN)
+        root.setSpacing(_DASH_SPACING)
 
-        self.sonar = SonarPanel(size=self.gcs.get("sonar", {}).get("size", 220),
-                                range_m=self.gcs.get("sonar", {}).get("range_m", 6.0),
-                                grid_lines=self.gcs.get("sonar", {}).get("grid_lines", 6))
-        self.sonar.setParent(container)
-        self.sonar.show()
+        # -- central camera focus zone (transparent; camera shows through) --
+        center = QWidget()
+        center.setObjectName("CameraViewport")
+        center.setStyleSheet("background: transparent;")
+        center.setMinimumSize(200, 200)
+        self._viewport = center
 
-        self.telemetry_panel = GlassPanel("SYSTEM TELEMETRY", parent=container)
-        self.telemetry_panel.setFixedWidth(210)
+        # -- left sidebar: telemetry / thrusters / motion ------------------
+        left_host = QWidget()
+        left_host.setFixedWidth(_SIDEBAR_W)
+        left_host.setStyleSheet("background: transparent;")
+        left = QVBoxLayout(left_host)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(_DASH_SPACING)
+
+        self.telemetry_panel = GlassPanel("SYSTEM TELEMETRY")
         self.telemetry_panel._values = {}
         tcfg = self.gcs.get("telemetry", {})
         for label, value in (
@@ -327,36 +343,9 @@ class MainWindow(QMainWindow):
         leak = _ValueRowCompact("LEAK SENSOR", tcfg.get("leak_status", "SAFE"), pill=True)
         self.telemetry_panel._values["LEAK SENSOR"] = leak
         self.telemetry_panel.add_row(leak)
-        self.telemetry_panel.adjustSize()
-        self.telemetry_panel.show()
+        left.addWidget(self.telemetry_panel)
 
-        self.flyout = self._build_flyout(container)
-
-        self.estop_btn = _DockButton("\u26d4", "E-STOP", danger=True)
-        self.estop_btn.clicked.connect(self._estop)
-        self.rearm_btn = _DockButton("\u27f3", "RE-ARM")
-        self.rearm_btn.clicked.connect(self._rearm)
-
-        self.dock = self._build_dock(container)
-
-        self.pad = ControlPad3D(container)
-        if self.controller is not None:
-            self.pad.motionChanged.connect(
-                lambda motion: self._pad_motion(motion)
-            )
-        self.pad.show()
-
-        self.heave_hint = QLabel("HEAVE: R / F")
-        self.heave_hint.setStyleSheet(
-            f"background: rgba(17, 32, 54, 0.55); color: {C['on_surface_variant']}; "
-            f"border: 1px solid {C['outline_variant']}; border-radius: 8px; "
-            f"padding: 2px 8px; font-size: 11px;"
-        )
-        self.heave_hint.setParent(container)
-        self.heave_hint.adjustSize()
-        self.heave_hint.show()
-
-        self.thruster_panel = GlassPanel("THRUSTERS M1-M5", parent=container)
+        self.thruster_panel = GlassPanel("THRUSTERS M1-M5")
         self.thruster_panel._values = {}
         motor_rows = {}
         for thruster in ThrusterId:
@@ -364,20 +353,112 @@ class MainWindow(QMainWindow):
             motor_rows[thruster] = row
             self.thruster_panel.add_row(row)
             self.thruster_panel._values[thruster.name] = row
-        self.thruster_panel.setFixedWidth(230)
-        self.thruster_panel.adjustSize()
-        self.thruster_panel.show()
         self._motor_rows = motor_rows
+        left.addWidget(self.thruster_panel)
 
-        self.motion_panel = GlassPanel("MOTION SURGE / YAW / HEAVE", parent=container)
+        self.motion_panel = GlassPanel("MOTION SURGE / YAW / HEAVE")
         self.motion_rows = {}
         for axis in ("surge", "yaw", "heave"):
             row = _AxisRow(axis)
             self.motion_rows[axis] = row
             self.motion_panel.add_row(row)
-        self.motion_panel.setFixedWidth(230)
-        self.motion_panel.adjustSize()
-        self.motion_panel.show()
+        left.addWidget(self.motion_panel)
+
+        left.addStretch(1)
+
+        # -- right sidebar: sonar / throttle / control pad -----------------
+        right_host = QWidget()
+        right_host.setFixedWidth(_SIDEBAR_W)
+        right_host.setStyleSheet("background: transparent;")
+        right = QVBoxLayout(right_host)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(_DASH_SPACING)
+
+        self.sonar = SonarPanel(size=self.gcs.get("sonar", {}).get("size", 220),
+                                range_m=self.gcs.get("sonar", {}).get("range_m", 6.0),
+                                grid_lines=self.gcs.get("sonar", {}).get("grid_lines", 6))
+        right.addWidget(self.sonar, 0, Qt.AlignHCenter)
+
+        self.throttle_panel = GlassPanel("THROTTLE MODE")
+        throttle_lay = QHBoxLayout()
+        throttle_lay.setContentsMargins(0, 0, 0, 0)
+        throttle_lay.setSpacing(6)
+        initial = "high"
+        if self.thrusters is not None:
+            initial = self.thrusters.throttle_mode
+        self.throttle_buttons = {}
+        for name, pct in (("soft", 40), ("medium", 70), ("high", 100)):
+            btn = QPushButton(f"{name.upper()}\n{pct}%")
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setMinimumHeight(40)
+            btn.clicked.connect(lambda _=False, n=name: self._set_throttle(n))
+            btn.setChecked(name == initial)
+            self.throttle_buttons[name] = btn
+            throttle_lay.addWidget(btn, 1)
+        self.throttle_panel.body().addLayout(throttle_lay)
+        self.power_value = QLabel("")
+        self.power_value.setStyleSheet(
+            f"font-family: {FONT_DATA}; font-size: 11px; color: {C['primary']};"
+        )
+        self.power_value.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        self.throttle_panel.body().addWidget(self.power_value)
+        self._refresh_power_readout()
+        right.addWidget(self.throttle_panel)
+
+        self.pad = ControlPad3D()
+        if self.controller is not None:
+            self.pad.motionChanged.connect(
+                lambda motion: self._pad_motion(motion)
+            )
+        right.addWidget(self.pad, 0, Qt.AlignHCenter)
+
+        self.heave_hint = QLabel("HEAVE: R / F")
+        self.heave_hint.setStyleSheet(
+            f"background: rgba(17, 32, 54, 0.55); color: {C['on_surface_variant']}; "
+            f"border: 1px solid {C['outline_variant']}; border-radius: 8px; "
+            f"padding: 2px 8px; font-size: 11px;"
+        )
+        right.addWidget(self.heave_hint, 0, Qt.AlignHCenter)
+
+        right.addStretch(1)
+
+        # -- assemble main row -------------------------------------------------
+        page = QHBoxLayout()
+        page.setSpacing(_DASH_SPACING)
+        page.addWidget(left_host)
+        page.addWidget(center, 1)
+        page.addWidget(right_host)
+        root.addLayout(page, 1)
+
+        # -- bottom dock bar ----------------------------------------------------
+        self.estop_btn = _DockButton("\u26d4", "E-STOP", danger=True)
+        self.estop_btn.clicked.connect(self._estop)
+        self.rearm_btn = _DockButton("\u27f3", "RE-ARM")
+        self.rearm_btn.clicked.connect(self._rearm)
+        self.dock = self._build_dock(container)
+        self.dock.setStyleSheet("background: transparent;")
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(_DASH_SPACING)
+        bottom.addStretch(1)
+        bottom.addWidget(self.dock, 0, Qt.AlignCenter)
+        bottom.addStretch(1)
+        root.addLayout(bottom)
+
+        # -- floating overlays: LIVE badge, mission-log flyout, status toast ---
+        self.live = QLabel()
+        self.live.setText(" \u25cf LIVE: CH-1 MAIN CAM")
+        self.live.setStyleSheet(
+            f"background: rgba(17, 32, 54, 0.55); color: {C['on_surface']}; "
+            f"border: 1px solid {C['outline_variant']}; border-radius: 8px; "
+            f"padding: 3px 10px; font-family: {FONT_DATA}; font-size: 12px;"
+        )
+        self.live.setParent(container)
+        self.live.adjustSize()
+        self.live.show()
+
+        self.flyout = self._build_flyout(container)
 
         self._status_toast = QLabel("")
         self._status_toast.setStyleSheet(
@@ -479,6 +560,17 @@ class MainWindow(QMainWindow):
         self._refresh_armed()
         self.status_message("RE-ARMED - thrusters handshake in progress", 3000)
 
+    def _set_throttle(self, name):
+        for key, btn in self.throttle_buttons.items():
+            btn.setChecked(key == name)
+        if self.thrusters is not None:
+            self.thrusters.set_throttle_mode(name)
+            limit = self.thrusters.throttle_limit
+        else:
+            limit = {"soft": 0.40, "medium": 0.70, "high": 1.0}[name]
+        self._refresh_power_readout()
+        self.status_message(f"THROTTLE: {name.upper()} — {int(limit * 100)}% MAX", 1500)
+
     def status_message(self, text, ms=2000):
         if hasattr(self, "_status_toast"):
             self._status_toast.setText(text)
@@ -486,6 +578,27 @@ class MainWindow(QMainWindow):
             self._status_toast.show()
             from PySide6.QtCore import QTimer as _T
             _T.singleShot(ms, self._status_toast.hide)
+
+    def _refresh_power_readout(self):
+        """Mode + live power readout under the throttle-mode buttons.
+
+        Shows the selected SOFT/MEDIUM/HARD ceiling and the current ACTIVE
+        (ramped, already-limited) power, e.g. ``MODE: SOFT 40% MAX | POWER 20%``.
+        """
+        if not hasattr(self, "power_value"):
+            return
+        limit = None
+        if self.thrusters is not None:
+            limit = self.thrusters.throttle_limit
+            peak = max(abs(v) for v in self.thrusters.last_setpoints.values())
+        else:
+            peak = 0.0
+        if limit is None:
+            text = "POWER: --"
+        else:
+            mode = self.thrusters.throttle_mode if self.thrusters is not None else "soft"
+            text = f"MODE: {mode.upper()} {int(limit * 100)}% MAX | POWER: {int(round(peak * 100))}%"
+        self.power_value.setText(text)
 
     def _toggle_armed(self):
         if self._estop_active:
@@ -551,31 +664,31 @@ class MainWindow(QMainWindow):
             self.controller.set_input("pad", motion)
 
     def _reposition_overlays(self):
+        """Keep the glass deck over the full-bleed camera and anchor the three
+        floating overlays (LIVE badge, mission-log flyout, status toast) to the
+        central focus zone. Everything else lives in Qt layouts, so nothing can
+        overlap unless the window is squeezed below the layout minimums.
+        """
         cw = self.camera_container.width()
         ch = self.camera_container.height()
-        m = 10
-        self.live.move(m, m)
-        self.telemetry_panel.move(m, self.live.y() + self.live.height() + 8)
-        self.sonar.move(cw - self.sonar.width() - m, m)
-        thruster_x = m
-        thruster_y = self.telemetry_panel.y() + self.telemetry_panel.height() + 8
-        self.thruster_panel.move(thruster_x, thruster_y)
-        self.motion_panel.move(thruster_x, thruster_y + self.thruster_panel.height() + 8)
-        self.dock.move(max(0, (cw - self.dock.sizeHint().width()) // 2),
-                       ch - self.dock.sizeHint().height() - 12)
-        self.pad.move(cw - self.pad.width() - m, ch - self.pad.height() - m)
-        self.heave_hint.move(self.pad.x() - self.heave_hint.sizeHint().width() - 8,
-                             self.pad.y() + self.pad.height() - self.heave_hint.height())
-        self._flyout_tab.move(0, ch // 2 - 30)
+        if hasattr(self, "_deck"):
+            self._deck.setGeometry(0, 0, cw, ch)
+            self._deck.raise_()
+        vp = self._viewport
+        vx = vp.mapTo(self.camera_container, vp.rect().topLeft()).x()
+        vy = vp.mapTo(self.camera_container, vp.rect().topLeft()).y()
+        vw, vh = vp.width(), vp.height()
+        m = _DASH_MARGIN
+        self.live.move(vx + m, vy + m)
+        self._flyout_tab.move(vx, vy + max(0, vh // 2 - 30))
         fy = self._flyout_tab.y() + 2
-        self._flyout_panel.move(20, fy)
-        for w in (self.live, self.sonar, self.telemetry_panel, self.dock, self.pad,
-                  self.heave_hint, self._flyout_tab, self._flyout_panel,
-                  self.thruster_panel, self.motion_panel, self._status_toast):
+        self._flyout_panel.move(vx + 20, fy)
+        for w in (self.live, self._flyout_tab, self._flyout_panel,
+                  self._status_toast):
             w.raise_()
         self._status_toast.move(
-            max(0, (cw - self._status_toast.width()) // 2),
-            ch - self._status_toast.height() - 16)
+            vx + max(0, (vw - self._status_toast.width()) // 2),
+            vy + max(0, vh - self._status_toast.height() - 16))
 
     def _set_section(self, key):
         self.stack.setCurrentWidget(self._pages[key])
@@ -633,6 +746,22 @@ class MainWindow(QMainWindow):
             if focus is None or not isinstance(focus, _TYPING_WIDGETS):
                 self._handle_key(event.key(), event.type() == QEvent.Type.KeyPress)
         return super().eventFilter(obj, event)
+
+    def _clear_pressed_keys(self):
+        """Drop every held key and zero the keyboard input (release safety)."""
+        if not self._pressed_actions:
+            return
+        self._pressed_actions.clear()
+        if self.controller is not None:
+            self.controller.set_input("keyboard", MotionState())
+            self.pad.set_yaw(0.0)
+
+    def focusOutEvent(self, event):
+        # Safety: if the ROV window loses OS focus while a movement key is held,
+        # clear every pressed action so motion eases back to zero instead of
+        # sticking while the operator works in another window.
+        self._clear_pressed_keys()
+        super().focusOutEvent(event)
 
     def _update_camera(self):
         frame = self.camera.read_frame() if self.camera is not None else None
@@ -738,6 +867,7 @@ class MainWindow(QMainWindow):
         self.esp32_pill.set_status(esp_status)
 
         if self.thrusters is not None:
+            self._refresh_power_readout()
             for thruster, row in self._motor_rows.items():
                 row.set_value(self.thrusters.last_setpoints.get(thruster, 0.0))
             motion = self.controller.last_motion if self.controller is not None else MotionState()
@@ -961,12 +1091,18 @@ class _MotorRow(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(8, 4, 8, 4)
         lay.setSpacing(8)
-        self.label = QLabel(str(thruster.name.replace("_", " ")))
+        role = _ROLES.get(thruster, "")
+        parts = role.split()
+        first = " ".join(parts[:2])
+        rest = parts[2] if len(parts) > 2 else ""
+        short = str(thruster.name).split("_")[0]
+        text = f"{short} {first}\n{rest}" if rest else f"{short} {first}"
+        self.label = QLabel(text)
         self.label.setStyleSheet(
             f"color: {C['on_surface_variant']}; font-weight: 700; font-size: 10px; "
-            f"letter-spacing: 1px;"
+            f"letter-spacing: 1px; line-height: 1.2;"
         )
-        self.label.setMinimumWidth(80)
+        self.label.setMinimumWidth(92)
         lay.addWidget(self.label)
         self.meter = _CenterMeter()
         lay.addWidget(self.meter, 1)
@@ -1000,7 +1136,7 @@ class _AxisRow(QWidget):
             f"color: {C['on_surface_variant']}; font-weight: 700; font-size: 10px; "
             f"letter-spacing: 1px;"
         )
-        self.label.setMinimumWidth(48)
+        self.label.setMinimumWidth(70)
         lay.addWidget(self.label)
         self.meter = _CenterMeter()
         lay.addWidget(self.meter, 1)

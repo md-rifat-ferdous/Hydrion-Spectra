@@ -18,8 +18,15 @@ Build a modular ROV software stack that:
 
 **Current milestone:** Phase 2 Part B is **DONE** — the ESP32 firmware protocol is fully implemented
 in Python (the Pi side), the GUI is upgraded with live thruster/motion panels, E-STOP/RE-ARM, ESP32
-UART diagnostics, and the system is tested end-to-end (72 unit tests pass, GUI boots clean with
+UART diagnostics, and the system is tested end-to-end (74 unit tests pass, GUI boots clean with
 simulated provider, ESP32 thread lifecycle verified).
+
+**Bench state (2026-09-20):** a real ESP32 is wired to the Pi's `ttyAMA0` (UART0, GPIO14/15) at
+460800 baud. The Pi now receives and decodes the ESP32's live STATUS telemetry (link alive, CRC clean);
+throttle modes (soft 40% / medium 70% / high 100%) and press-and-hold 10% ramp are implemented. One
+open item remains: **the physical Pi→ESP32 TX path is not yet verified** — the ESP32 has never emitted
+an ACK, so its RX (UART0 / GPIO3, see §9) does not appear to be receiving the Pi's frames. See §9
+Progress Log.
 
 ---
 
@@ -61,7 +68,7 @@ dubo/
 │   └── network.yaml     # telemetry link settings
 ├── systemd/             # rov-controller.service — auto-start template (Step 6)
 ├── scripts/             # start.sh / stop.sh / restart.sh
-├── tests/               # 72 unit tests (mixer + UART transport + provider)
+├── tests/               # 74 unit tests (mixer + UART transport + provider)
 ├── logs/                # system.log / errors.log / mission.log (runtime)
 └── .venv/               # Python 3.13 virtualenv with deps
 ```
@@ -223,8 +230,9 @@ Supported axes: **surge, yaw, heave**. No sway. Pitch/roll kept for future, prod
 
 ## 7. Hardware Integration (Simulation-first)
 
-Every module is written against a clean interface. Currently returns simulated values; real hardware
-is attached later by swapping the provider — nothing else changes.
+Every module is written against a clean interface. The ESP32 link is live on the bench (see §9
+current state); sensors still return simulated values until hardware is attached by swapping the
+provider — nothing else changes.
 
 ### ESP32 UART Protocol (firmware reference)
 
@@ -256,6 +264,17 @@ last-2  CRC16        CRC-16/CCITT-FALSE over ENTIRE frame INCLUDING the
 | ACK | 0x81 | ESP32→Pi | STATUS(1) + ECHO_SEQ(2); total 5 bytes region but LENGTH=3 |
 | STATUS | 0x82 | ESP32→Pi | FAILSAFE(1) + ESTOP(1) + M1..M5 int16(10); LENGTH=14, 12 meaningful |
 
+**Firmware STATUS-length quirk (measured on the wire):** the ESP32's `sendStatus()` writes
+`AA55 VERSION TYPE LENGTH=14 | SEQ(2) FAILSAFE(1) ESTOP(1) M1..M5(10) | CRC(2)` — the 2-byte sequence
+is counted INSIDE LENGTH, so a STATUS frame is **21 bytes (5 + LENGTH + 2)**, not 7 + LENGTH + 2.
+`parse_frame()` special-cases `MSG_STATUS` (head = 5) to match; other frame types are 7 + LENGTH + 2.
+`decode_status()` parses the full 14-byte payload (`sequence`, `failsafe`, `estop`, `motors`).
+
+**Throttle modes (2026-09-20):** UI throttle buttons map to limits — **soft 40%, medium 70%,
+high 100%** (`THROTTLE_MODES`). The selected mode caps the ramp ceiling; press-and-hold keys climb
+the setpoint by **fixed `THROTTLE_STEP = 0.10` per update** (release eases back down the same steps).
+Ramp logic lives in `ThrusterManager._ramp_setpoints()`.
+
 **ACK status codes:**
 0=OK, 1=CRC error, 2=invalid payload length, 3=invalid motor value, 4=invalid flags,
 5=old sequence, 6=unknown packet type, 7=E-STOP active.
@@ -277,9 +296,14 @@ last-2  CRC16        CRC-16/CCITT-FALSE over ENTIRE frame INCLUDING the
 - ESP32 250ms watchdog: no accepted command → ESCs stop automatically (failsafe).
 - Pi link timeout: `heartbeat_timeout_ms` (default 1500ms, STATUS cadence 500ms).
 
-**To get real values:** set `thrusters.provider: esp32` and point `thrusters.esp32.serial_port`
-at the USB-UART adapter. Nothing else changes — the app tolerates a missing device (reports
-disconnected, retries reconnects, never crashes).
+**To get real values:** `thrusters.provider: esp32` and `thrusters.esp32.serial_port` point at the
+Pi's on-board `/dev/ttyAMA0` (UART0, GPIO14/15). The app tolerates a missing device (reports
+disconnected, retries reconnects, never crashes). The ESP32 uses its **UART0** pins — **RX0 =
+GPIO3**, **TX0 = GPIO1** — so the Pi TX (GPIO14) must feed GPIO3 and the Pi RX (GPIO15) must come
+from GPIO1, with common GND. GPIO1/GPIO3 also carry the USB-serial/programming interface: during
+normal runtime UART0 is dedicated to the Pi (keep debug `Serial.println()` off UART0), and while
+flashing over USB, disconnect the Pi UART wires if they interfere. Do not wire GPIO16/GPIO17
+(UART2) or GPIO21/GPIO22 for this link.
 
 ### ESP32 GPIO Mapping (wiring, must not change)
 
@@ -321,9 +345,25 @@ The ROV controller auto-starts on boot and restarts if it crashes.
 
 ### Current state
 
-> Everything runs with simulated/dummy data — real ESP32 hardware is not attached yet.
-> **ESP32 UART protocol is fully implemented on the Pi side.** ESP32 firmware exists as a
-> separate `.ino` sketch (Arduino-ESP32) — the Pi's `uart_transport.py` matches it exactly.
+> **2026-09-20 bench session:** a real ESP32 is attached to the Pi's on-board UART (**`/dev/ttyAMA0`
+> = UART0, GPIO14 TXD0 / GPIO15 RXD0**, 460800 baud). Everything below verified live:
+>
+> - ESP32→Pi **RX works**: 21-byte STATUS(0x82) frames every 500 ms are decoded cleanly
+>   (link_alive=True, `rx_frames` increment, 0 CRC errors). CRC verified `0xDE64` matches
+>   CRC-16/CCITT-FALSE over the full frame.
+> - **Fixes applied this session:**
+>   - `Esp32ThrusterProvider.initialize()` was never called from `ThrusterManager.initialize()` —
+>     the 50Hz UART thread never ran, so nothing was ever transmitted (`tx_seq` stayed `None`).
+>   - STATUS parser now handles the firmware's 21-byte framing (seq counted inside LENGTH).
+>   - Throttle modes soft/medium/high (40/70/100%) + 10% press-and-hold ramp.
+> - **Pi→ESP32 TX is electrically confirmed on the Pi side** (GPIO14 muxed `TXD0`, `out_waiting` drains)
+>   and the emitted frames are **byte-perfect for the firmware** — the firmware's `readUART`/`processPacket`
+>   state machine was re-implemented in Python and DUBO's real builders feed it an `ACK_OK` on every path.
+> - **Open item (hardware):** the ESP32 has never produced a single ACK(0x81) and its STATUS always
+>   shows `failsafe=1` / `lastSequence=0` since boot — i.e. it is receiving **nothing**. A 30-second
+>   loopback short of GPIO14↔GPIO15 definitively splits "Pi TX dead" vs "ESP RX/firmware side". Verify
+>   the physical GPIO14 (pin 8) → ESP32 GPIO3 (RX0) connection first (firmware moved to ESP32 UART0
+>   GPIO1/GPIO3; **do not** use GPIO16/GPIO17).
 
 | # | Step | Status |
 |---|------|--------|
@@ -338,8 +378,83 @@ The ROV controller auto-starts on boot and restarts if it crashes.
 | P2A | ESP32 link (Pi side) | done |
 | P2B | ESP32 firmware (Pi-side protocol matched) | done |
 | P2B+ | Real-time UI upgrade (thrusters/motion/E-STOP/diagnostics) | done |
+| P2C | Throttle modes + press-and-hold ramp | done |
+| P2D | Live ESP32 on the bench: RX/STATUS decoded, TX pending | partly – RX done, **TX open** |
 
 ### Change record (most recent first)
+
+- **2026-09-22 — Verification pass (98 tests passing, no refactor)**
+  - Ran a full verification pass of the completed controller/UI work (no code changes unless a real bug
+    was found). Verified end-to-end through the live window + controller + thruster loop: every key
+    binding (W/S/A/D/Q/E/R/F, Shift boost, Backspace E-STOP), key-release-to-zero, the exact 10 % ramp
+    trajectories and ceilings (SOFT 0.1→0.4 stop, MEDIUM 0.1→0.7 stop, HARD 0.1→1.0 stop), release
+    ease-back, mixer (M1/M4/M5=heave, M2=surge+yaw, M3=surge−yaw), no sway/pitch/roll motor output,
+    E-STOP→zero, RE-ARM→zero, and UART config (`/dev/ttyAMA0`, 460800, 8N1, no flow control).
+  - **Bug found & fixed (one line):** `ThrusterManager.emergency_stop()` reset `_last = None`, so the
+    first post-E-STOP update tick hit the seed guard and left the previous setpoint (`M2=1.0`) displayed
+    for one 100 ms tick instead of zeroing immediately. Removed the unnecessary `_last = None` (dt is
+    already clamped to ≤0.25 s); E-STOP now forces every setpoint to zero on the immediate next tick.
+  - Static checks: no duplicate power state (single owner `ThrusterManager._throttle_mode`), no
+    duplicate keyboard handler (single `eventFilter → _handle_key` path), no GUI-blocking `sleep()`
+    (only the ESP32 provider's background thread), no unsafe non-zero startup command (ESP32 zero-gate
+    `_gate` + thread-sent ESTOP), no direct serial access from UI/controller (serial confined to
+    `uart_transport.py`).
+  - `uart_transport.py` was not rewritten: the diff vs. the previous baseline is only the already-documented
+    STATUS-frame length quirk fix (LENGTH includes the 2-byte sequence) + `decode_status` re-alignment;
+    header/version/CRC and the existing binary protocol are unchanged.
+  - Remaining (not claimed): physical Pi→ESP32 handshake (ACK 0x81, STATUS `failsafe=0`) after rewiring
+    to GPIO3/GPIO1, motors OFF throughout.
+
+- **2026-09-22 — ESP32 UART moved to UART0 (GPIO3/GPIO1) + keyboard/power verified (98 tests passing)**
+  - **Hardware wiring change:** the ESP32 link now uses **UART0** pins — **RX0 = GPIO3**, **TX0 = GPIO1** —
+    instead of UART2 (RX2/GPIO16, TX2/GPIO17). `configs/thrusters.yaml` now documents `esp32.rx_pin: 3` /
+    `esp32.tx_pin: 1` (metadata; the Pi never drives these pins). Pi side unchanged: `/dev/ttyAMA0`
+    (GPIO14 TXD0 → ESP32 GPIO3, GPIO15 RXD0 ← ESP32 GPIO1, common GND) at 460800 baud 8N1.
+  - **UART0/USB note:** GPIO1/GPIO3 double as the ESP32 USB-serial interface — during runtime UART0 is
+    dedicated to the Pi (keep debug `Serial.println()` off UART0); unplug the Pi UART wires while
+    flashing over USB. Do not use GPIO16/17 or GPIO21/22.
+  - **Keyboard verified (no logic regression found):** the full W/S/A/D/Q/E/R/F + Shift(boost) +
+    Backspace(E-STOP) keymap (14 bindings) is intact in `ui/main_window.py` and driven through
+    `ControllerModule`. Added `tests/test_controller_input.py` proving every binding, key-release →
+    safe-zero, Shift boost and Backspace E-STOP. Hardened the GUI: `StrongFocus` + `focusOutEvent`/
+    `_clear_pressed_keys()` so a held key can never stick after the window loses focus.
+  - **Power modes verified:** SOFT 40 % / MEDIUM 70 % / HIGH 100 % ceilings with the fixed 10 %
+    press-and-hold ramp (`THROTTLE_MODES`, `THROTTLE_STEP = 0.10`, `_ramp_setpoints`) — new
+    `ThrottleRampTest` locks the exact 0→10→…→ceiling trajectories and release ease-back. Dashboard
+    THROTTLE panel now shows `MODE: SOFT 40% MAX | POWER: 20%` live.
+  - **Config tests:** `UartConfigTest` asserts `/dev/ttyAMA0`, 460800 baud, `rx_pin=3`/`tx_pin=1` and
+    the unchanged M1..M5 GPIO mapping (25/33/32/27/26).
+  - **Hardware left to verify (not claimed):** the physical Pi↔ESP32 UART handshake — ACK(0x81) receipt
+    and STATUS `failsafe=0` — after re-wiring to GPIO3/GPIO1. Motors must stay powered OFF during this
+    check (all setpoints start/remain zero until the ESP32 ACKs a zero command).
+
+- **2026-09-20 — Live bench session: real ESP32 link characterized + fixes (74 tests passing)**
+  - **Serial target:** moved from `/dev/ttyUSB0` to the Pi's on-board **`/dev/ttyAMA0`** (UART0,
+    GPIO14 TXD0 / GPIO15 RXD0) in `configs/thrusters.yaml`; baud 460800. `pinctrl` + `dtparam=uart0=on`
+    confirmed the mux; no other process holds the port.
+  - **Bug fix:** `ThrusterManager.initialize()` now calls `provider.initialize()` when present
+    (`modules/thrusters/thruster_manager.py`). Without it the `Esp32ThrusterProvider.initialize()`
+    handshake (probe timeout, 50Hz thread start, `_seq_seeded` handling) never ran — earlier
+    "configured" but silently-empty TX path.
+  - **Protocol fix: 21-byte STATUS frames.** The firmware's `sendStatus()` counts the 2-byte sequence
+    inside `LENGTH=14`, so a STATUS frame is `5 + LENGTH + 2 = 21` bytes, not `7 + LENGTH + 2 = 23`.
+    `parse_frame()` now special-cases `MSG_STATUS` (head = 5); `decode_status()` parses the 14-byte
+    payload (`sequence`, `failsafe`, `estop`, `motors`). Tests updated: `build_status()` now emits the
+    exact firmware wire format (21 bytes).
+  - **Throttle modes:** `THROTTLE_MODES = {"soft": 0.40, "medium": 0.70, "high": 1.0}` in
+    `thruster_manager.py`, `THROTTLE_STEP = 0.10` fixed-step ramp (hold to climb, release to ease).
+    UI (`ui/main_window.py`): buttons soft/medium/high, initial "high". Renamed old `hard`→`high`;
+    `0.65`→`0.70` test fixture.
+  - **On-wire verification:** received STATUS CRC `0xDE64` matched `crc16_ccitt` exactly; 13 clean
+    STATUS frames decoded with 0 CRC/resync errors during a W-key press-hold harness.
+  - **Software cross-check of TX:** the firmware's exact `readUART()` + `processPacket()` was
+    re-implemented in Python (`/tmp/opencode/fw_sim_check.py`) and fed DUBO's real `build_motor_command`/
+    `build_estop` frames — every path returns `ACK_OK` (seq gate, CRC, length all match). Combined with
+    `out_waiting` draining, the Pi transmits valid bytes.
+  - **Open:** ESP32 never ACKs and reports `lastSequence=0 / failsafe=1` since boot ⇒ its RX
+    (UART0 RX0 / GPIO3) is not receiving. Physical check (GPIO14→GPIO3 wiring, then GPIO14↔GPIO15
+    loopback) is the only remaining step before motors can be driven. (ESP32 now uses UART0
+    GPIO1/GPIO3 — see §7 wiring.)
 
 - **2026-09-14 — Phase 2 Part B+ (Step 4): Real-time 5-thruster control + UI upgrade**
   - **UART protocol rewrite:** `modules/thrusters/uart_transport.py` completely rewritten to match
@@ -421,18 +536,20 @@ source .venv/bin/activate
 python -m unittest discover -s tests -v
 ```
 
-### What's tested (72 tests)
+### What's tested (74 tests)
 
-**test_thruster_mixer.py (26 tests):**
+**test_thruster_mixer.py (28 tests):**
 - 5-thruster mixer: neutral, forward/backward, yaw left/right, up/down, combined axes.
 - Saturation clamping, unsupported axes (sway/pitch/roll), direction flip, five-output invariant.
 - ThrusterManager: forward setpoints, emergency stop, clear stop, fallback provider, GPIO config.
+- Throttle modes: soft 40%, medium 70%, high 100%; 10% press-and-hold ramp.
 
 **test_uart_transport.py (46 tests):**
 - Protocol framing: header layout, uint16 sequence, motor command 11-byte payload, CRC covers header.
 - CRC validation: CCITT-FALSE check value (0x29B1), bad CRC rejection, header-modified CRC.
 - Roundtrip: build → parse, parse incomplete frame, parse oversized length.
-- ACK/STATUS: firmware-style payloads, all 8 status codes, STATUS 14-byte payload region.
+- ACK/STATUS: firmware-style payloads, all 8 status codes, STATUS 21-byte wire format (firmware
+  LENGTH=14 counts the 2-byte sequence), full 14-byte payload decode (seq/failsafe/estop/motors).
 - Transport: open/close/rate-limited reconnect, send/write/drop, pump/resync through garbage,
   partial frame buffering across reads.
 - Provider: safety gate (zeros until ACK), ESTOP message type (not flag), rearm handshake,
@@ -454,20 +571,4 @@ class SmokeApp(Application):
         apply_theme(self.qt_app)
         self.main_window = self.create_window()
         self.main_window.show()
-        QTimer.singleShot(500, self.qt_app.quit)
-        return self.qt_app.exec()
-SmokeApp().run()
-EOF
-```
-
----
-
-## 11. Working Style
-
-Build one small step at a time; verify after each step.
-
-```bash
-tree -a -I "__pycache__|*.pyc|.venv"     # view structure
-python app/main.py                        # run app
-python -m unittest discover -s tests      # run all tests
-```
+        QTimer.singleShot(500,                                                                                                                                                                                                                                                                                                                                                       

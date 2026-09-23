@@ -32,6 +32,7 @@ Safety model:
 """
 
 import logging
+import os
 import time
 import threading
 from abc import ABC, abstractmethod
@@ -74,6 +75,22 @@ DEFAULT_GPIO = {
 }
 
 SUPPORTED_AXES = ("surge", "yaw", "heave")
+
+# Dashboard throttle limiter: the max fraction of command each mode allows.
+#   soft   = 40 % of the commanded thrust
+#   medium = 70 %
+#   high   = 100 % (full)
+THROTTLE_MODES = {"soft": 0.40, "medium": 0.70, "high": 1.0}
+DEFAULT_THROTTLE_MODE = "soft"
+DEFAULT_THROTTLE_RAMP = 1.0  # fraction of full range per second
+THROTTLE_STEP = 0.10         # fixed 10 % climb/ease step per control tick
+
+# Focused per-tick pipeline trace: KEY INPUT / MIXER / POWER-RAMP / APPLIED.
+# Off by default; set HYDRION_TRACE_PIPELINE=1 to watch one key press flow
+# through the whole chain (e.g.  W ->  surge=1.00 -> M2/M3 = +1.00 in the
+# mixer -> +0.10, +0.20, ... ramped setpoints). Remove the flag and the
+# ``_trace_pipeline`` method once the investigation is done.
+TRACE_PIPELINE = os.environ.get("HYDRION_TRACE_PIPELINE", "") == "1"
 
 _ROLES = {
     ThrusterId.M1_FRONT_VERTICAL: "FRONT VERTICAL",
@@ -588,6 +605,10 @@ class ThrusterManager(BaseModule):
         self._last = None
         self._estop = False
         self._failsafe_shown = None
+        self._throttle_mode = str(self.config.get("throttle_mode", DEFAULT_THROTTLE_MODE)).lower()
+        if self._throttle_mode not in THROTTLE_MODES:
+            self._throttle_mode = DEFAULT_THROTTLE_MODE
+        self._throttle_ramp = float(self.config.get("throttle_ramp_per_sec", DEFAULT_THROTTLE_RAMP))
         self.last_setpoints = {thruster: 0.0 for thruster in ThrusterId}
 
     def initialize(self):
@@ -604,6 +625,9 @@ class ThrusterManager(BaseModule):
             name = "simulated"
         self.provider = provider_cls(self.config, sensors=self.sensors)
         self.provider_name = name
+        provider_initialize = getattr(self.provider, "initialize", None)
+        if callable(provider_initialize):
+            provider_initialize()
         self.logger.info("Thruster provider: %s (5-motor layout)", name)
         return True
 
@@ -614,11 +638,57 @@ class ThrusterManager(BaseModule):
     def is_esp32(self):
         return self.provider_name == "esp32"
 
+    @property
+    def throttle_mode(self):
+        return self._throttle_mode
+
+    @property
+    def throttle_limit(self):
+        """Max commanded fraction allowed by the active throttle mode."""
+        return THROTTLE_MODES[self._throttle_mode]
+
+    @property
+    def current_power(self):
+        """Peak absolute value of the current ramped motor setpoints (0..1)."""
+        return max((abs(v) for v in self.last_setpoints.values()), default=0.0)
+
+    def set_throttle_mode(self, name):
+        """Select soft/medium/high throttle limit from the dashboard."""
+        name = str(name).lower()
+        if name not in THROTTLE_MODES:
+            self.logger.warning("Unknown throttle mode '%s'; keeping '%s'", name, self._throttle_mode)
+            return
+        self._throttle_mode = name
+        self.logger.info("Throttle mode -> %s (max %d%%)", name, int(self.throttle_limit * 100))
+
+    def _ramp_setpoints(self, target, dt):
+        """Move current setpoints toward ``target`` in fixed 10 % steps.
+
+        Every control tick each thruster climbs (or eases back) by one
+        THROTTLE_STEP toward the commanded value instead of snapping to
+        full thrust, so holding a key builds up 10 % at a time and
+        releasing lets it ease back the same way.
+        """
+        limit = self.throttle_limit
+        rate_step = max(0.0, self._throttle_ramp) * max(0.1, dt)
+        step = max(THROTTLE_STEP, rate_step)
+        prev = self.last_setpoints
+        ramped = {}
+        for thruster in ThrusterId:
+            current = prev.get(thruster, 0.0)
+            desired = max(-limit, min(limit, float(target.get(thruster, 0.0))))
+            delta = desired - current
+            if abs(delta) <= step:
+                next_val = desired
+            else:
+                next_val = current + (step if delta > 0 else -step)
+            ramped[thruster] = max(-1.0, min(1.0, next_val))
+        return ramped
+
     def emergency_stop(self):
         """Independent software e-stop; the ESP32 provider additionally issues
         a latched ESTOP frame so the ESC controller halts."""
         self._estop = True
-        self._last = None
         self.logger.warning("EMERGENCY STOP: all thrusters zeroed")
         notify = getattr(self.provider, "notify_estop", None)
         if callable(notify):
@@ -647,25 +717,61 @@ class ThrusterManager(BaseModule):
                 keepalive(dt, self.last_setpoints)
             return
 
-        self.last_setpoints = self.provider.setpoints(self._motion)
+        mixed = self.provider.setpoints(self._motion)
+        self.last_setpoints = self._ramp_setpoints(mixed, dt)
 
         link_ok = self._link_ok()
         failsafe_active = bool(self.is_esp32) and not link_ok
         if failsafe_active:
-            self.last_setpoints = {thruster: 0.0 for thruster in ThrusterId}
+            # Internal ramped setpoints stay intact: ``last_setpoints`` IS the
+            # real command state (the GUI meters and diagnostics read it and it
+            # must not be flattened to zero just because the link is unhappy).
+            # What the provider is allowed to APPLY, however, is zeroed until
+            # the ESP32 link is alive again. The ESP32 provider also keeps its
+            # own wire-level gate closed (only zeros hit the bus) while it is
+            # gated, re-arming, or E-STOPped, so the physical motors stay safe.
+            applied = {thruster: 0.0 for thruster in ThrusterId}
             if self._failsafe_shown is not True:
                 self._failsafe_shown = True
                 self.logger.error(
                     "FAILSAFE: ESP32 link not alive (%s); motor outputs zeroed",
                     self._link_reason(),
                 )
-        elif self._failsafe_shown is True:
-            self._failsafe_shown = False
-            self.logger.info("FAILSAFE CLEARED: motor outputs re-enabled")
+        else:
+            applied = self.last_setpoints
+            if self._failsafe_shown is True:
+                self._failsafe_shown = False
+                self.logger.info("FAILSAFE CLEARED: motor outputs re-enabled")
 
         if any(abs(v) > 0.01 for v in self.last_setpoints.values()):
             self.logger.debug("Setpoints: %s", self.last_setpoints)
-        self.provider.apply(self._motion, dt, setpoints=self.last_setpoints)
+        self._trace_pipeline(self._motion, mixed, applied)
+        self.provider.apply(self._motion, dt, setpoints=applied)
+
+    def _trace_pipeline(self, motion, mixed, applied):
+        """Per-tick INPUT / MIXER / POWER-RAMP / APPLIED trace for debugging."""
+        if not TRACE_PIPELINE:
+            return
+
+        def num(value):
+            return "+%.2f" % value if value >= 0 else "%.2f" % value
+
+        self.logger.info(
+            "INPUT:      surge=%+.2f yaw=%+.2f heave=%+.2f (sway/pitch/roll not mixed)",
+            motion.surge, motion.yaw, motion.heave,
+        )
+        self.logger.info(
+            "MIXER:      M1=%s M2=%s M3=%s M4=%s M5=%s",
+            *[num(mixed[t]) for t in ThrusterId],
+        )
+        self.logger.info(
+            "POWER/RAMP: M1=%s M2=%s M3=%s M4=%s M5=%s",
+            *[num(self.last_setpoints[t]) for t in ThrusterId],
+        )
+        self.logger.info(
+            "APPLIED:    M1=%s M2=%s M3=%s M4=%s M5=%s",
+            *[num(applied[t]) for t in ThrusterId],
+        )
 
     def _link_ok(self):
         if not self.is_esp32:

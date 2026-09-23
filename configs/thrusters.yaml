@@ -17,9 +17,20 @@ thrusters:
   #                            link is shown in the UI as disconnected, and the
   #                            provider retries reconnects. It never crashes.
   # ------------------------------------------------------------------
-  provider: simulated
+  provider: esp32
   speed_mps: 0.8
   turn_rate_degps: 60.0
+
+  # Dashboard throttle limiter. 3 modes cap the commanded thrust:
+  #   soft   = 40 %,  medium = 70 %,  high = 100 % (full).
+  # Selectable live from the dashboard THROTTLE MODE widget; this key only
+  # sets the mode the app boots with.
+  throttle_mode: soft
+  # Ramp rate (fraction of full range per second). Every thruster climbs and
+  # eases back toward the commanded value in fixed 10 % steps per control tick
+  # (default 10 % per 100 ms) instead of snapping to full throttle while a
+  # key is held. Holding the key builds thrust up 10 % at a time.
+  throttle_ramp_per_sec: 1.0
   # 5-thruster layout (Phase 1). DO NOT change this mapping.
   #   gpio      = ESP32 pin (metadata — the Raspberry Pi never drives these pins).
   #   direction = physical motor sign (+1/-1). Default +1. Verify each motor
@@ -45,11 +56,22 @@ thrusters:
   # Everything here is read from config — nothing is hardcoded in Python.
   # The UART protocol matches the flashed ESP32 firmware exactly.
   esp32:
-    # Serial device of the USB-UART adapter connected to the ESP32 (RX=GPIO16,
-    # TX=GPIO17 at 460800 baud). Prefer the stable /dev/serial/by-id/ symlink
-    # over /dev/ttyUSB0.
-    serial_port: "/dev/ttyUSB0"
-    baudrate: 460800           # ESP32 firmware UART_BAUDRATE
+    # Serial device of the Raspberry Pi's on-board UART (UART0 / ttyAMA0).
+    # Wiring:
+    #   Pi  GPIO14 (TXD0, physical pin 8)  -> ESP32 GPIO3  (RX0)
+    #   Pi  GPIO15 (RXD0, physical pin 10) <- ESP32 GPIO1  (TX0)
+    #   Pi  GND   (physical pin 6)          <-> ESP32 GND
+    # The ESP32 uses its UART0 pins (RX0 = GPIO3, TX0 = GPIO1). These are
+    # shared with the USB-serial/programming interface: during normal ROV
+    # runtime UART0 is dedicated to the Pi (no debug Serial.println() on it);
+    # while flashing over USB, disconnect the Pi UART wires if they interfere.
+    # Do NOT use GPIO16/GPIO17 (UART2) or GPIO21/GPIO22 for this connection.
+    serial_port: "/dev/ttyAMA0"
+    baudrate: 460800           # ESP32 firmware UART_BAUDRATE (verified - replies at 460800)
+    # ESP32 UART pins (metadata — the Raspberry Pi never drives these; used by
+    # the ESP32 firmware to configure its UART0: RX=GPIO3, TX=GPIO1).
+    rx_pin: 3                  # ESP32 GPIO3 (RX0)
+    tx_pin: 1                  # ESP32 GPIO1 (TX0)
     timeout_ms: 100            # read/write timeout on the serial port
     command_rate_hz: 50        # stable MOTOR_COMMAND stream rate to the ESP32
                                # (the ESP32 250 ms watchdog needs >= 4 Hz)

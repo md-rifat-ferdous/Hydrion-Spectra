@@ -371,16 +371,21 @@ def parse_frame(data, version=PROTOCOL_VERSION):
     if len(data) < _MIN_HEAD or data[: len(HEADER)] != HEADER:
         raise ValueError("missing header")
     length = data[4]
-    total = _MIN_HEAD + length + _CRC_SIZE
+    mtype = data[3]
+    # ESP32 firmware quirk: sendStatus() counts the 2-byte sequence INSIDE
+    # LENGTH (LENGTH=14 for seq + failsafe + estop + M1..M5), so a STATUS
+    # frame is 5 + LENGTH + 2 bytes on the wire while every other frame type
+    # is 7 + LENGTH + 2 (sequence lives in the fixed 2-byte header slot).
+    head = 5 if mtype == MSG_STATUS else _MIN_HEAD
+    total = head + length + _CRC_SIZE
     if total > MAX_FRAME_SIZE:
         raise ValueError("invalid length")
     if len(data) < total:
         raise IncompleteFrame()
     ver = data[2]
-    mtype = data[3]
     sequence = struct.unpack_from("<H", data, 5)[0]
-    payload = data[_MIN_HEAD : _MIN_HEAD + length]
-    crc = struct.unpack_from("<H", data, _MIN_HEAD + length)[0]
+    payload = data[head : head + length]
+    crc = struct.unpack_from("<H", data, head + length)[0]
     if ver != version:
         raise ValueError("version mismatch")
     if crc16_ccitt(data[:total - _CRC_SIZE]) != crc:
@@ -422,11 +427,17 @@ def decode_ack(payload):
 
 
 def decode_status(payload):
-    """Return ``dict(failsafe, estop, motors)`` from a STATUS payload (14 bytes)."""
-    if len(payload) < 12:
+    """Return ``dict(failsafe, estop, motors)`` from a STATUS payload (14 bytes).
+
+    The firmware's sendStatus() declares LENGTH=14 and writes
+    sequence(2) failsafe(1) estop(1) M1..M5 int16(10), with that sequence also
+    occupying the header sequence slot (the whole frame is 21 bytes on the wire).
+    """
+    if len(payload) < 14:
         raise ValueError("bad status payload")
     return {
-        "failsafe": bool(payload[0]),
-        "estop": bool(payload[1]),
-        "motors": tuple(struct.unpack("<5h", payload[2:12])),
+        "sequence": struct.unpack_from("<H", payload, 0)[0],
+        "failsafe": bool(payload[2]),
+        "estop": bool(payload[3]),
+        "motors": tuple(struct.unpack_from("<5h", payload, 4)),
     }
