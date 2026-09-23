@@ -1,7 +1,8 @@
-"""Circular 3D motion controller (Hydrion Spectra style).
+"""Circular 3D motion controller (DUBO style).
 
-Stick = surge/sway. The dashed outer ring spins to indicate commanded yaw
-(updated externally via `set_yaw`). Heave stays on the keyboard (R/F).
+Stick = surge/yaw (the 5-thruster ROV has no sway). The dashed outer ring
+spins to indicate commanded yaw, updated both while dragging and externally
+via `set_yaw`. Heave stays on the keyboard (R/F).
 """
 
 import math
@@ -40,14 +41,22 @@ class ControlPad3D(QWidget):
     def set_yaw(self, value):
         self._yaw_cmd = max(-1.0, min(1.0, value))
 
+    def reset(self):
+        self._joy = QPointF()
+        self._yaw_cmd = 0.0
+        self.update()
+
     def _tick(self):
         if self._yaw_cmd:
             self._ring_angle += 1.6 * self._yaw_cmd
             self.update()
 
     def _emit(self):
+        yaw = float(self._joy.x())
+        self._yaw_cmd = yaw
+        self.update()
         self.motionChanged.emit(
-            MotionState(surge=-self._joy.y(), sway=self._joy.x())
+            MotionState(surge=-self._joy.y(), yaw=yaw)
         )
 
     def _set_joy(self, pos):

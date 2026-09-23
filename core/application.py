@@ -78,6 +78,7 @@ class Application:
         sensors = self.service_manager.get("Sensors")
         controller = self.service_manager.get("Controller")
         telemetry = self.service_manager.get("Telemetry")
+        thrusters = self.service_manager.get("Thrusters")
         keymap = self.config_manager.get_section("controller").get("keymap", {})
         return MainWindow(
             camera,
@@ -90,6 +91,7 @@ class Application:
             telemetry=telemetry,
             log_dir=self.logger_manager.log_dir,
             gcs_config=self.config_manager.get_section("gcs") or {},
+            thrusters=thrusters,
         )
 
     def run(self):

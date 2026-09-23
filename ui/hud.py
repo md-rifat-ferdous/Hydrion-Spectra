@@ -1,4 +1,4 @@
-"""HUD overlays drawn into the video frame (Hydrion Spectra style).
+"""HUD overlays drawn into the video frame (DUBO style).
 
 Top-center: heading compass. Center: crosshair + pitch ladder. Left-middle:
 depth pillar. Right-middle: altitude pillar. (The sonar map lives in
@@ -25,6 +25,7 @@ class HudOverlay:
         self.crosshair_enabled = cfg.get("crosshair", {}).get("enabled", True)
         self.compass_enabled = cfg.get("compass", {}).get("enabled", True)
         self.depth_alt_enabled = cfg.get("depth_alt", {}).get("enabled", True)
+        self.extra_enabled = cfg.get("extra", {}).get("enabled", True)
 
         colors = cfg.get("colors", {})
         self._c = {
@@ -76,7 +77,7 @@ class HudOverlay:
         edge = mask - erode
         frame[edge > 0] = border or self._c["cyan"]
 
-    def render(self, frame, state):
+    def render(self, frame, state, extra=None):
         if not self.enabled or frame is None:
             return frame
         h, w = frame.shape[:2]
@@ -89,6 +90,8 @@ class HudOverlay:
         if self.depth_alt_enabled:
             self._draw_depth(frame, state, h)
             self._draw_alt(frame, state, h, w)
+        if self.extra_enabled and extra:
+            self._draw_status_chips(frame, extra, w)
         return frame
 
     def _draw_compass(self, frame, state, w):
@@ -148,4 +151,21 @@ class HudOverlay:
         self._text(frame, "ALT", (x1 - pw + 28, y0 + 24), self._c["variant"], 0.4, 1)
         self._text(frame, f"{state.alt:4.1f}", (x1 - pw + 24, y0 + 52), self._c["blue"], 0.6, 2)
         self._text(frame, "m", (x1 - pw + 34, y0 + 78), self._c["variant"], 0.4, 1)
+
+    def _draw_status_chips(self, frame, extra, w):
+        import cv2 as _cv2
+        esp32 = extra.get("esp32", "OFF").upper()
+        estop = "E-STOP" if extra.get("estop") else "NORMAL"
+        mode = extra.get("mode", "MANUAL")
+        parts = [f"{mode}"]
+        if extra.get("armed"):
+            parts.append("ARMED")
+        parts.append(f"ESP {esp32}")
+        parts.append(estop)
+        text = "  ".join(parts)
+        pw = 40 + len(text) * 8
+        x0, y0 = 10, 52
+        self._panel(frame, x0, y0, min(w - 10, x0 + pw), y0 + 22, radius=8, alpha=0.7)
+        color = (0, 0, 255) if extra.get("estop") else self._c["cyan"]
+        self._text(frame, text, (x0 + 10, y0 + 16), color, 0.38, 1)
 

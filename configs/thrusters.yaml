@@ -1,8 +1,81 @@
 thrusters:
   enabled: true
-  provider: simulated
+  # ------------------------------------------------------------------
+  # PROVIDER SELECTION (explicit):
+  #
+  #   provider: simulated   -> runs fully on-device, no hardware required (DEFAULT).
+  #                            Drives the simulated sensor state with the real
+  #                            mixer outputs. Safe to leave enabled.
+  #
+  #   provider: esp32       -> REAL HARDWARE. Sends the already-mixed M1..M5
+  #                            setpoints to the ESP32 ESC controller over UART
+  #                            (Phase 2, 50 Hz stream). To switch, edit ONE line:
+  #                                provider: simulated  ->  provider: esp32
+  #                            Also make sure `esp32.serial_port` below points at
+  #                            the USB-UART adapter. If the port is unreachable the
+  #                            app keeps running: motors are FAILSAFE zeroed, the
+  #                            link is shown in the UI as disconnected, and the
+  #                            provider retries reconnects. It never crashes.
+  # ------------------------------------------------------------------
+  provider: esp32
   speed_mps: 0.8
   turn_rate_degps: 60.0
-  layout:
-    horizontal: [FL, FR, BL, BR]
-    vertical: [VT1, VT2]
+
+  # Dashboard throttle limiter. 3 modes cap the commanded thrust:
+  #   soft   = 40 %,  medium = 70 %,  high = 100 % (full).
+  # Selectable live from the dashboard THROTTLE MODE widget; this key only
+  # sets the mode the app boots with.
+  throttle_mode: soft
+  # Ramp rate (fraction of full range per second). Every thruster climbs and
+  # eases back toward the commanded value in fixed 10 % steps per control tick
+  # (default 10 % per 100 ms) instead of snapping to full throttle while a
+  # key is held. Holding the key builds thrust up 10 % at a time.
+  throttle_ramp_per_sec: 1.0
+  # 5-thruster layout (Phase 1). DO NOT change this mapping.
+  #   gpio      = ESP32 pin (metadata — the Raspberry Pi never drives these pins).
+  #   direction = physical motor sign (+1/-1). Default +1. Verify each motor
+  #               on the real ROV and flip here if a motor is mounted reversed.
+  motors:
+    M1_FRONT_VERTICAL:
+      gpio: 25
+      direction: 1
+    M2_MIDDLE_RIGHT_HORIZONTAL:
+      gpio: 33
+      direction: 1
+    M3_MIDDLE_LEFT_HORIZONTAL:
+      gpio: 32
+      direction: 1
+    M4_BACK_RIGHT_VERTICAL:
+      gpio: 27
+      direction: 1
+    M5_BACK_LEFT_VERTICAL:
+      gpio: 26
+      direction: 1
+
+  # Phase 2: ESP32 ESC controller link.
+  # Everything here is read from config — nothing is hardcoded in Python.
+  # The UART protocol matches the flashed ESP32 firmware exactly.
+  esp32:
+    # Serial device of the Raspberry Pi's on-board UART (UART0 / ttyAMA0).
+    # Wiring:
+    #   Pi  GPIO14 (TXD0, physical pin 8)  -> ESP32 GPIO3  (RX0)
+    #   Pi  GPIO15 (RXD0, physical pin 10) <- ESP32 GPIO1  (TX0)
+    #   Pi  GND   (physical pin 6)          <-> ESP32 GND
+    # The ESP32 uses its UART0 pins (RX0 = GPIO3, TX0 = GPIO1). These are
+    # shared with the USB-serial/programming interface: during normal ROV
+    # runtime UART0 is dedicated to the Pi (no debug Serial.println() on it);
+    # while flashing over USB, disconnect the Pi UART wires if they interfere.
+    # Do NOT use GPIO16/GPIO17 (UART2) or GPIO21/GPIO22 for this connection.
+    serial_port: "/dev/ttyAMA0"
+    baudrate: 460800           # ESP32 firmware UART_BAUDRATE (verified - replies at 460800)
+    # ESP32 UART pins (metadata — the Raspberry Pi never drives these; used by
+    # the ESP32 firmware to configure its UART0: RX=GPIO3, TX=GPIO1).
+    rx_pin: 3                  # ESP32 GPIO3 (RX0)
+    tx_pin: 1                  # ESP32 GPIO1 (TX0)
+    timeout_ms: 100            # read/write timeout on the serial port
+    command_rate_hz: 50        # stable MOTOR_COMMAND stream rate to the ESP32
+                               # (the ESP32 250 ms watchdog needs >= 4 Hz)
+    heartbeat_timeout_ms: 1500 # no frame from the ESP32 for this long -> link
+                               # STALE -> Pi-side failsafe clamps to zero.
+                               # ESP32 sends a STATUS frame every 500 ms.
+    reconnect_interval_s: 1.0  # min seconds between serial (re)open attempts

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -55,7 +56,7 @@ class SensorsPage(QWidget):
         hl = QHBoxLayout()
         hl.setSpacing(8)
         self._health_pills = {}
-        for name in ("IMU", "DEPTH", "CAMERA", "LINK"):
+        for name in ("IMU", "DEPTH", "CAMERA", "LINK", "ESP32"):
             pill = StatusPill(name, "info")
             self._health_pills[name] = pill
             hl.addWidget(pill)
@@ -85,7 +86,19 @@ class SensorsPage(QWidget):
             self.roll.set_value(f"{m.roll * 60:+.0f}")
             self.boost.set_value("ON" if m.boost else "OFF")
         for name, pill in self._health_pills.items():
-            pill.set_status("ok")
+            if name == "ESP32":
+                thrusters = self.ctx.get("thrusters")
+                status = thrusters.get_provider_status() if thrusters is not None else None
+                if status is None:
+                    pill.set_status("ok")
+                elif status.get("link_alive") and status.get("connected"):
+                    pill.set_status("ok")
+                elif status.get("connected"):
+                    pill.set_status("warn")
+                else:
+                    pill.set_status("bad")
+            else:
+                pill.set_status("ok")
 
 
 class DiagnosticsPage(QWidget):
@@ -117,9 +130,34 @@ class DiagnosticsPage(QWidget):
         for r in (self.latency, self.link):
             umb.add_row(r)
 
+        self.esp32_panel = GlassPanel("ESP32 THRUSTER LINK (UART)")
+        self.esp32_state = ValueRow("STATE", "--", highlight=True)
+        self.esp32_provider = ValueRow("PROVIDER", "--")
+        self.esp32_estop = ValueRow("ESTOP", "--")
+        self.esp32_failsafe = ValueRow("FAILSAFE", "--")
+        self.esp32_rearm = ValueRow("RE-ARM", "--")
+        self.esp32_tx = ValueRow("TX FRAMES", "--")
+        self.esp32_rx = ValueRow("RX FRAMES", "--")
+        self.esp32_crc = ValueRow("CRC ERRORS", "--")
+        self.esp32_resync = ValueRow("RESYNCS", "--")
+        self.esp32_missing = ValueRow("MISSING ACKS", "--")
+        self.esp32_latency = ValueRow("ACK LATENCY", "--")
+        self.esp32_seq = ValueRow("ESP32 SEQ", "--")
+        self.esp32_motors = ValueRow("ESP32 MOTORS", "--")
+        self.esp32_error = ValueRow("LAST ERROR", "--")
+        for r in (self.esp32_state, self.esp32_provider, self.esp32_estop,
+                  self.esp32_failsafe, self.esp32_rearm, self.esp32_tx,
+                  self.esp32_rx, self.esp32_crc, self.esp32_resync,
+                  self.esp32_missing, self.esp32_latency, self.esp32_seq,
+                  self.esp32_motors, self.esp32_error):
+            self.esp32_panel.add_row(r)
+        self.esp32_controls = _ThrusterControls(ctx)
+        self.esp32_panel.add_row(self.esp32_controls)
+
         page.add(self.health_panel)
         page.add(perf)
         page.add(umb)
+        page.add(self.esp32_panel)
 
     def update(self):
         sm = self.ctx["service_manager"]
@@ -142,6 +180,47 @@ class DiagnosticsPage(QWidget):
         self.cpu.set_value(cpu)
         self.ram.set_value(ram)
         self.uptime.set_value(self.ctx.get("uptime")())
+
+        self._update_esp32()
+
+    def _update_esp32(self):
+        thrusters = self.ctx.get("thrusters")
+        status = thrusters.get_provider_status() if thrusters is not None else None
+        if status is None:
+            self.esp32_state.set_value("SIMULATED")
+            self.esp32_provider.set_value("simulated")
+            self.esp32_controls.setEnabled(False)
+            return
+        self.esp32_controls.setEnabled(True)
+        connected = status.get("connected")
+        alive = status.get("link_alive")
+        if connected and alive:
+            state, state_color = "CONNECTED", "#64ffda"
+        elif connected:
+            state, state_color = "STALE", "#ffd364"
+        else:
+            state, state_color = "OFFLINE", "#ffb4ab"
+        self.esp32_state.val.setStyleSheet(f"font-family: 'JetBrains Mono'; font-size: 12px; color: {state_color};")
+        self.esp32_state.set_value(state)
+        self.esp32_provider.set_value(status.get("provider", "--"))
+        self.esp32_estop.set_value("ACTIVE" if status.get("estop") else "CLEAR")
+        self.esp32_failsafe.set_value("ACTIVE" if status.get("failsafe") else "CLEAR")
+        self.esp32_rearm.set_value("PENDING" if status.get("rearming") else "DONE")
+        self.esp32_tx.set_value(status.get("tx_frames", 0))
+        self.esp32_rx.set_value(status.get("rx_frames", 0))
+        self.esp32_crc.set_value(status.get("crc_errors", 0))
+        self.esp32_resync.set_value(status.get("resyncs", 0))
+        self.esp32_missing.set_value(status.get("missing_acks", 0))
+        latency = status.get("last_ack_latency_s")
+        self.esp32_latency.set_value(
+            f"{latency * 1000:.0f} ms" if latency is not None else "--")
+        esp_seq = status.get("esp32_seq")
+        self.esp32_seq.set_value(str(esp_seq) if esp_seq is not None else "--")
+        motors = status.get("esp32_motors")
+        self.esp32_motors.set_value(
+            " ".join(f"{v:+d}" for v in motors) if motors else "--")
+        error = status.get("last_error")
+        self.esp32_error.set_value(error if error else "OK")
 
     @staticmethod
     def _load():
@@ -244,8 +323,24 @@ class OperationsPage(QWidget):
         cmd.add_row(self.cmd_input)
         cmd.add_row(send)
 
+        thrust = GlassPanel("THRUSTERS (5-MOTOR)")
+        self._thrust_rows = {}
+        for name in ("M1_FRONT_VERTICAL", "M2_MIDDLE_RIGHT_HORIZONTAL",
+                     "M3_MIDDLE_LEFT_HORIZONTAL", "M4_BACK_RIGHT_VERTICAL",
+                     "M5_BACK_LEFT_VERTICAL"):
+            short = name.split("_")[0]
+            row = ValueRow(short, "0%")
+            self._thrust_rows[name] = row
+            thrust.add_row(row)
+        self.thrust_estop = ValueRow("E-STOP STATE", "--")
+        self.thrust_failsafe = ValueRow("FAILSAFE", "--")
+        thrust.add_row(self.thrust_estop)
+        thrust.add_row(self.thrust_failsafe)
+        thrust.add_row(ThrusterControlsWidget(ctx))
+
         page.add(status)
         page.add(cmd)
+        page.add(thrust)
 
     def _send(self):
         text = self.cmd_input.toPlainText().strip()
@@ -259,6 +354,18 @@ class OperationsPage(QWidget):
         self.armed_pill.set_status("ok" if armed else "warn")
         self.link_pill.setText("LINK OK" if self.ctx.get("link_ok")() else "LINK DOWN")
         self.link_pill.set_status("ok" if self.ctx.get("link_ok")() else "bad")
+        thrusters = self.ctx.get("thrusters")
+        if thrusters is not None:
+            setpoints = thrusters.last_setpoints
+            for name, row in self._thrust_rows.items():
+                key = next((t for t in setpoints if t.name == name), None)
+                value = setpoints.get(key, 0.0) if key is not None else 0.0
+                row.set_value(f"{int(value * 100):+d}%")
+            provider = thrusters.get_provider_status()
+            self.thrust_estop.set_value(
+                "ACTIVE" if (provider or {}).get("estop") else "CLEAR")
+            self.thrust_failsafe.set_value(
+                "ACTIVE" if (provider or {}).get("failsafe") else "CLEAR")
 
 
 class NavigationPage(QWidget):
@@ -360,6 +467,43 @@ class PlannerPage(QWidget):
         val = GlassPanel("PLAN VALIDATION")
         val.add_row(ValueRow("STATUS", "--"))
         page.add(val)
+
+
+class ThrusterControlsWidget(QWidget):
+    """E-STOP / RE-ARM buttons wired to the thruster manager."""
+
+    def __init__(self, ctx, parent=None):
+        super().__init__(parent)
+        self.ctx = ctx
+        self.estop_btn = QPushButton(" E-STOP ")
+        self.estop_btn.setObjectName("Danger")
+        self.estop_btn.clicked.connect(self._estop)
+        self.rearm_btn = QPushButton(" RE-ARM ")
+        self.rearm_btn.clicked.connect(self._rearm)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.estop_btn)
+        row.addWidget(self.rearm_btn)
+        row.addStretch(1)
+
+    def _estop(self):
+        thrusters = self.ctx.get("thrusters")
+        if thrusters is not None:
+            thrusters.emergency_stop()
+        controller = self.ctx.get("controller")
+        if controller is not None:
+            controller.kill()
+
+    def _rearm(self):
+        thrusters = self.ctx.get("thrusters")
+        if thrusters is not None:
+            thrusters.clear_emergency_stop()
+        controller = self.ctx.get("controller")
+        if controller is not None:
+            controller.recover()
+
+
+_ThrusterControls = ThrusterControlsWidget
 
 
 def build(ctx):

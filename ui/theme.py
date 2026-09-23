@@ -1,4 +1,4 @@
-"""Design tokens for the Hydrion Spectra GCS ("Dark Ocean" glassmorphism).
+"""Design tokens for the DUBO GCS ("Dark Ocean" glassmorphism).
 
 Pulled from stitch_hydrion_spectra_gcs/hydrion_spectra_gcs/DESIGN.md.
 """
@@ -38,7 +38,7 @@ def ui(color):
 
 
 def apply_theme(app):
-    """Apply the global Hydrion Spectra stylesheet to the application."""
+    """Apply the global DUBO stylesheet to the application."""
     app.setStyleSheet(_GLOBAL_QSS)
 
 

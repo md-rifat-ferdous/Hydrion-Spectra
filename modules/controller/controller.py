@@ -14,11 +14,14 @@ class MotionState:
     boost: bool = False
 
 
+# The 5-thruster ROV supports surge / yaw / heave only. LEFT/RIGHT therefore
+# turn the vehicle (yaw); sway produces no motor output. PITCH/ROLL command
+# slots are kept for future stabilization but are NOT mixed in Phase 1.
 COMMANDS = {
     "FORWARD": ("surge", 1.0),
     "BACK": ("surge", -1.0),
-    "LEFT": ("sway", -1.0),
-    "RIGHT": ("sway", 1.0),
+    "LEFT": ("yaw", -1.0),
+    "RIGHT": ("yaw", 1.0),
     "UP": ("heave", 1.0),
     "DOWN": ("heave", -1.0),
     "TURN_LEFT": ("yaw", -1.0),
